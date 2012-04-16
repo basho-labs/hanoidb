@@ -170,8 +170,7 @@ fold_buckets(FoldBucketsFun, Acc, Opts, #state{tree=Tree}) ->
     BucketFolder =
         fun() ->
                 try
-                    Range = #btree_range{to_key = <<>>},
-                    lsm_btree:sync_fold_range(Tree, FoldFun, {Acc, []}, Range)
+                    lsm_btree:sync_fold_range(Tree, FoldFun, {Acc, []}, #btree_range{})
                 catch
                     {break, AccFinal} ->
                         AccFinal
@@ -197,9 +196,16 @@ fold_keys(FoldKeysFun, Acc, Opts, #state{tree=Tree}) ->
 
     %% Multiple limiters may exist. Take the most specific limiter.
     Limiter =
-        if Index /= false  -> Index;
-           Bucket /= false -> Bucket;
-           true            -> undefined
+        if Index /= false  ->
+                %% TODO: figure out the proper key prefixes for Index!
+                Range = #btree_range{},
+                Index;
+           Bucket /= false ->
+                Range = bucket_range(Bucket),
+                Bucket;
+           true            ->
+                Range = #btree_range{},
+                undefined
         end,
 
     %% Set up the fold...
@@ -207,7 +213,6 @@ fold_keys(FoldKeysFun, Acc, Opts, #state{tree=Tree}) ->
     KeyFolder =
         fun() ->
                 try
-                    Range = #btree_range{to_key = <<>>},
                     lsm_btree:sync_fold_range(Tree, FoldFun, Acc, Range)
                 catch
                     {break, AccFinal} ->
@@ -221,6 +226,18 @@ fold_keys(FoldKeysFun, Acc, Opts, #state{tree=Tree}) ->
             {ok, KeyFolder()}
     end.
 
+%% @doc Get btree_range object for entire bucket
+bucket_range(undefined) ->
+    #btree_range{};
+bucket_range(Bucket) ->
+    #btree_range{
+              from_key       = to_object_key(Bucket, '_'),
+              from_inclusive = true,
+              to_key         = to_object_key(<<Bucket, 0>>, '_'),
+              to_inclusive   = false
+             }.
+
+
 %% @doc Fold over all the objects for one or all buckets.
 -spec fold_objects(riak_kv_backend:fold_objects_fun(),
                    any(),
@@ -232,8 +249,7 @@ fold_objects(FoldObjectsFun, Acc, Opts, #state{tree=Tree}) ->
     ObjectFolder =
         fun() ->
                 try
-                    Range = #btree_range{to_key = <<>>},
-                    lsm_btree:sync_fold_range(Tree, FoldFun, Acc, Range)
+                    lsm_btree:sync_fold_range(Tree, FoldFun, Acc, bucket_range(Bucket))
                 catch
                     {break, AccFinal} ->
                         AccFinal
@@ -258,7 +274,7 @@ drop(#state{}=State) ->
 is_empty(#state{tree=Tree}) ->
     FoldFun = fun(_K, _V, _Acc) -> throw(ok) end,
     try
-        Range = #btree_range{to_key = <<>>},
+        Range = #btree_range{},
         [] =:= lsm_btree:sync_fold_range(Tree, FoldFun, [], Range)
     catch
         _:ok ->
