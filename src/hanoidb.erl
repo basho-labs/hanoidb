@@ -31,7 +31,7 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
--export([open/1, open/2, transact/2, close/1, get/2, lookup/2, delete/2, put/3,
+-export([open/1, open/2, transact/2, close/1, get/2, lookup/2, delete/2, put/3, put/4,
          fold/3, fold_range/4, destroy/1]).
 
 -export([get_opt/2, get_opt/3]).
@@ -57,7 +57,7 @@
 
 -type hanoidb() :: pid().
 -type key_range() :: #key_range{}.
--type config_option() :: {compress, none | gzip | snappy}
+-type config_option() :: {compress, none | gzip | snappy} %lz4
                        | {page_size, pos_integer()}
                        | {read_buffer_size, pos_integer()}
                        | {write_buffer_size, pos_integer()}
@@ -122,7 +122,14 @@ delete(Ref,Key) when is_binary(Key) ->
 -spec put(hanoidb(), binary(), binary()) ->
                  ok | {error, term()}.
 put(Ref,Key,Value) when is_binary(Key), is_binary(Value) ->
-    gen_server:call(Ref, {put, Key, Value}, infinity).
+    gen_server:call(Ref, {put, Key, Value, infinity}, infinity).
+
+-spec put(hanoidb(), binary(), binary(), integer()) ->
+                 ok | {error, term()}.
+put(Ref,Key,Value,infinity) when is_binary(Key), is_binary(Value) ->
+    gen_server:call(Ref, {put, Key, Value, infinity}, infinity);
+put(Ref,Key,Value,Expiry) when is_binary(Key), is_binary(Value) ->
+    gen_server:call(Ref, {put, Key, Value, Expiry}, infinity).
 
 -type transact_spec() :: {put, binary(), binary()} | {delete, binary()}.
 -spec transact(hanoidb(), [transact_spec()]) ->
@@ -137,17 +144,17 @@ fold(Ref,Fun,Acc0) ->
     fold_range(Ref,Fun,Acc0,#key_range{from_key= <<>>, to_key=undefined}).
 
 -spec fold_range(hanoidb(),kv_fold_fun(),any(),key_range()) -> any().
-fold_range(Ref,Fun,Acc0,Range) ->
+fold_range(Ref,Fun,Acc0,#key_range{limit=Limit}=Range) ->
+    RangeType = case Limit < 10 of
+                    true -> blocking_range;
+                    false -> snapshot_range
+                end,
     {ok, FoldWorkerPID} = hanoidb_fold_worker:start(self()),
-    if Range#key_range.limit < 10 ->
-            ok = gen_server:call(Ref, {blocking_range, FoldWorkerPID, Range}, infinity);
-       true ->
-            ok = gen_server:call(Ref, {snapshot_range, FoldWorkerPID, Range}, infinity)
-    end,
-    MRef = erlang:monitor(process, FoldWorkerPID),
     ?log("fold_range begin: self=~p, worker=~p~n", [self(), FoldWorkerPID]),
-    Result = receive_fold_range(MRef, FoldWorkerPID, Fun, Acc0, Range#key_range.limit),
-    ?log("fold_range done: self:~p, result=~P~n", [self(), Result, 20]),
+    ok = gen_server:call(Ref, {RangeType, FoldWorkerPID, Range}, infinity),
+    MRef = erlang:monitor(process, FoldWorkerPID),
+    Result = receive_fold_range(MRef, FoldWorkerPID, Fun, Acc0, Limit),
+    ?log("fold_range done: self:~p, result=~P~n", [self(), Result]),
     Result.
 
 receive_fold_range(MRef,PID,_,Acc0, 0) ->
@@ -166,8 +173,7 @@ receive_fold_range(MRef,PID,Fun,Acc0, Limit) ->
                     {ok, Fun(K,V,Acc0)}
                 catch
                     Class:Exception ->
-                        % ?log("Exception in hanoidb fold: ~p ~p", [Exception, erlang:get_stacktrace()]),
-                        % lager:warn("Exception in hanoidb fold: ~p", [Exception]),
+                        % TODO ?log("Exception in hanoidb fold: ~p ~p", [Exception, erlang:get_stacktrace()]),
                         {'EXIT', Class, Exception, erlang:get_stacktrace()}
                 end
             of
@@ -371,8 +377,8 @@ handle_call({blocking_range, FoldWorkerPID, Range}, _From, State=#state{ top=Top
     Result = hanoidb_level:blocking_range(TopLevel, FoldWorkerPID, Range),
     {reply, Result, State};
 
-handle_call({put, Key, Value}, _From, State) when is_binary(Key), is_binary(Value) ->
-    {ok, State2} = do_put(Key, Value, State),
+handle_call({put, Key, Value, Expiry}, _From, State) when is_binary(Key), is_binary(Value) ->
+    {ok, State2} = do_put(Key, Value, Expiry, State),
     {reply, ok, State2};
 
 handle_call({transact, TransactionSpec}, _From, State) ->
@@ -380,7 +386,7 @@ handle_call({transact, TransactionSpec}, _From, State) ->
     {reply, ok, State2};
 
 handle_call({delete, Key}, _From, State) when is_binary(Key) ->
-    {ok, State2} = do_put(Key, ?TOMBSTONE, State),
+    {ok, State2} = do_put(Key, ?TOMBSTONE, infinity, State),
     {reply, ok, State2};
 
 handle_call({get, Key}, From, State=#state{ top=Top, nursery=Nursery } ) when is_binary(Key) ->
@@ -411,16 +417,16 @@ handle_call(destroy, _From, State=#state{top=Top, nursery=Nursery }) ->
     {stop, normal, ok, State#state{ top=undefined, nursery=undefined, max_level=?TOP_LEVEL }}.
 
 
-do_put(Key, Value, State=#state{ nursery=Nursery, top=Top }) ->
-    {ok, Nursery2} = hanoidb_nursery:add_maybe_flush(Key, Value, Nursery, Top),
-    {ok, State#state{ nursery=Nursery2 }}.
+do_put(Key, Value, Expiry, State=#state{ nursery=Nursery, top=Top }) ->
+    {ok, Nursery2} = hanoidb_nursery:add(Key, Value, Expiry, Nursery, Top),
+    {ok, State#state{nursery=Nursery2}}.
 
 do_transact([{put, Key, Value}], State) ->
-    do_put(Key, Value, State);
+    do_put(Key, Value, infinity, State);
 do_transact([{delete, Key}], State) ->
-    do_put(Key, ?TOMBSTONE, State);
-do_transact([], _State) ->
-    ok;
+    do_put(Key, ?TOMBSTONE, infinity, State);
+do_transact([], State) ->
+    {ok, State};
 do_transact(TransactionSpec, State=#state{ nursery=Nursery, top=Top }) ->
     {ok, Nursery2} = hanoidb_nursery:transact(TransactionSpec, Nursery, Top),
     {ok, State#state{ nursery=Nursery2 }}.
@@ -431,7 +437,6 @@ flush_nursery(State=#state{nursery=Nursery, top=Top, dir=Dir, max_level=MaxLevel
     {ok, State#state{ nursery=Nursery2 }}.
 
 start_app() ->
-    application:start(lager),
     case application:start(?MODULE) of
         ok ->
             ok;
@@ -454,4 +459,3 @@ get_opt(Key, Opts, Default) ->
         Value ->
             Value
     end.
-

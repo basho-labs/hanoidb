@@ -25,8 +25,10 @@
 
 %% smallest levels are 256 entries
 -define(TOP_LEVEL, 8).
--define(IDX_LEVEL_SIZE(Level), (1 bsl (Level))).
+-define(BTREE_SIZE(Level), (1 bsl (Level))).
 -define(IDX_GROWTH_FACTOR, 2).
+-define(FIRST_BLOCK_POS, 4).
+-define(FILE_FORMAT, <<"HAN1">>).
 
 -define(TOMBSTONE, 'deleted').
 

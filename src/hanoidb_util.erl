@@ -76,50 +76,53 @@ estimate_node_size_increment(_KVList,Key,Value) ->
 -define(NO_COMPRESSION, 0).
 -define(SNAPPY_COMPRESSION, 1).
 -define(GZIP_COMPRESSION, 2).
+%-define(LZ4_COMPRESSION, 3).
 
-encode_index_node(KVList, Compress) ->
+compress(Method, Bin) ->
+    {MethodName, Compressed} = do_compression(Method, Bin),
+    case MethodName of
+        ?NO_COMPRESSION ->
+            {?NO_COMPRESSION, Bin};
+        _ ->
+            case byte_size(Compressed) < erlang:iolist_size(Bin) of
+                true ->
+                    {MethodName, Compressed};
+                false ->
+                    {?NO_COMPRESSION, Bin}
+            end
+    end.
 
+do_compression(snappy, Bin) ->
+    {ok, SnappyCompressed} = snappy:compress(Bin),
+    {?SNAPPY_COMPRESSION, SnappyCompressed};
+%do_compression(lz4, Bin) ->
+%    {?LZ4_COMPRESSION, lz4:compress(Bin)};
+do_compression(gzip, Bin) ->
+    {?GZIP_COMPRESSION, zlib:gzip(Bin)};
+do_compression(_, Bin) ->
+    {?NO_COMPRESSION, Bin}.
+
+decompress(<<?NO_COMPRESSION, Data/binary>>) ->
+    Data;
+decompress(<<?SNAPPY_COMPRESSION, Data/binary>>) ->
+    {ok, UncompressedData} = snappy:decompress(Data),
+    UncompressedData;
+%decompress(<<?LZ4_COMPRESSION, Data/binary>>) ->
+%    lz4:uncompress(Data);
+decompress(<<?GZIP_COMPRESSION, Data/binary>>) ->
+    zlib:gunzip(Data).
+
+encode_index_node(KVList, Method) ->
     TermData = [ ?TAG_END |
                  lists:map(fun ({Key,Value}) ->
                                    crc_encapsulate_kv_entry(Key, Value)
                            end,
                            KVList) ],
+    {MethodName, OutData} = compress(Method, TermData),
+    {ok, [MethodName | OutData]}.
 
-    case Compress of
-        snappy ->
-            DataSize = erlang:iolist_size(TermData),
-            {ok, Snappied} = snappy:compress(TermData),
-            if byte_size(Snappied) > DataSize ->
-                    OutData = [?NO_COMPRESSION|TermData];
-               true ->
-                    OutData = [?SNAPPY_COMPRESSION|Snappied]
-            end;
-        gzip ->
-            DataSize = erlang:iolist_size(TermData),
-            GZipData = zlib:gzip(TermData),
-            if byte_size(GZipData) > DataSize ->
-                    OutData = [?NO_COMPRESSION|TermData];
-               true ->
-                    OutData = [?GZIP_COMPRESSION|GZipData]
-            end;
-        _ ->
-            OutData = [?NO_COMPRESSION|TermData]
-    end,
-
-    {ok, OutData}.
-
-
-decode_index_node(Level, <<Tag, Data/binary>>) ->
-
-    case Tag of
-        ?NO_COMPRESSION ->
-            TermData = Data;
-        ?SNAPPY_COMPRESSION ->
-            {ok, TermData} = snappy:decompress(Data);
-        ?GZIP_COMPRESSION ->
-            TermData = zlib:gunzip(Data)
-    end,
-
+decode_index_node(Level, Data) ->
+    TermData = decompress(Data),
     {ok, KVList} = decode_kv_list(TermData),
     {ok, {node, Level, KVList}}.
 
@@ -133,22 +136,22 @@ crc_encapsulate_kv_entry(Key, {Value, TStamp}) when is_binary(Value) ->
 crc_encapsulate_kv_entry(Key, Value) when is_binary(Value) ->
     crc_encapsulate( [?TAG_KV_DATA, <<(byte_size(Key)):32/unsigned>>, Key | Value] );
 crc_encapsulate_kv_entry(Key, {Pos,Len}) when Len < 16#ffffffff ->
-    crc_encapsulate( [?TAG_POSLEN32, <<Pos:64/unsigned, Len:32/unsigned>>, Key ] ).
+    crc_encapsulate( [?TAG_POSLEN32, <<Pos:64/unsigned, Len:32/unsigned>>, Key] ).
 
 
 crc_encapsulate_transaction(TransactionSpec, TStamp) ->
-    crc_encapsulate( [?TAG_TRANSACT |
-             lists:map( fun({delete, Key}) ->
+    crc_encapsulate([?TAG_TRANSACT |
+             lists:map(fun({delete, Key}) ->
                                 crc_encapsulate_kv_entry(Key, {?TOMBSTONE, TStamp});
                            ({put, Key, Value}) ->
                                 crc_encapsulate_kv_entry(Key, {Value, TStamp})
                         end,
-                        TransactionSpec)] ).
+                        TransactionSpec)]).
 
 crc_encapsulate(Blob) ->
     CRC = erlang:crc32(Blob),
     Size = erlang:iolist_size(Blob),
-    [ << (Size):32/unsigned, CRC:32/unsigned >>, Blob, ?TAG_END ].
+    [<< (Size):32/unsigned, CRC:32/unsigned >>, Blob, ?TAG_END].
 
 decode_kv_list(<<?TAG_END, Custom/binary>>) ->
     decode_crc_data(Custom, [], []);
@@ -164,20 +167,18 @@ decode_kv_list(<<?CRC_ENCODED, Custom/binary>>) ->
 decode_crc_data(<<>>, [], Acc) ->
     {ok, lists:reverse(Acc)};
 
-decode_crc_data(<<>>, BrokenData, Acc) ->
+decode_crc_data(<<>>, _BrokenData, Acc) ->
     {ok, lists:reverse(Acc)};
-%%
-%% TODO: here we *should* report data corruption rather than
-%% simply returning "the good parts".
-%%
-%%    {error, data_corruption};
+    % TODO: here we *should* report data corruption rather than
+    % simply returning "the good parts".
+    %    {error, data_corruption};
 
 decode_crc_data(<< BinSize:32/unsigned, CRC:32/unsigned, Bin:BinSize/binary, ?TAG_END, Rest/binary >>, Broken, Acc) ->
     CRCTest = erlang:crc32( Bin ),
     if CRC == CRCTest ->
             decode_crc_data(Rest, Broken, [ decode_kv_data( Bin ) | Acc ]);
        true ->
-            %% chunk is broken, ignore it. Maybe we should tell someone?
+            %% TODO: chunk is broken, ignore it. Maybe we should tell someone?
             decode_crc_data(Rest, [Bin|Broken], Acc)
     end;
 
@@ -227,14 +228,14 @@ tstamp() ->
     {Mega, Sec, _Micro} = os:timestamp(),
     (Mega * 1000000) + Sec.
 
-%% @doc Return time when values expire (i.e. Now - ExpirySecs), or 0.
--spec expiry_time([_]) -> pos_integer().
-expiry_time(Opts) ->
-    ExpirySecs = hanoidb:get_opt(expiry_secs, Opts),
-    case ExpirySecs > 0 of
-        true -> tstamp() - ExpirySecs;
-        false -> 0
-    end.
+%% @doc Return time when values expire (i.e. Now + ExpirySecs), or 0.
+-spec expiry_time(pos_integer()) -> pos_integer().
+expiry_time(ExpirySecs) when ExpirySecs > 0 ->
+    tstamp() + ExpirySecs.
+
+-spec has_expired(pos_integer()) -> true|false.
+has_expired(Expiration) when Expiration > 0 ->
+    Expiration < tstamp().
 
 ensure_expiry(Opts) ->
     case hanoidb:get_opt(expiry_secs, Opts) of

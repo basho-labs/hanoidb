@@ -55,9 +55,8 @@
 
                  bloom,
                  block_size = ?NODE_SIZE,
-                 compress   = none :: none | snappy | gzip,
+                 compress   = none :: none | snappy | gzip, % | lz4,
                  opts  = [],
-                 expiry_time,
 
                  value_count = 0,
                  tombstone_count = 0
@@ -95,7 +94,7 @@ init([Name,Options]) ->
 %    io:format("got name: ~p~n", [Name]),
     case do_open(Name, Options, [exclusive]) of
         {ok, IdxFile} ->
-            file:write(IdxFile, <<"HAN1">>),
+            file:write(IdxFile, ?FILE_FORMAT),
             {ok, BloomFilter} = ebloom:new(erlang:min(Size,16#ffffffff), 0.01, 123),
             BlockSize = hanoidb:get_opt(block_size, Options, ?NODE_SIZE),
             {ok, #state{ name=Name,
@@ -103,8 +102,7 @@ init([Name,Options]) ->
                          bloom = BloomFilter,
                          block_size = BlockSize,
                          compress = hanoidb:get_opt(compress, Options, none),
-                         opts = Options,
-                         expiry_time = hanoidb_util:expiry_time(Options)
+                         opts = Options
                        }};
         {error, _}=Error ->
             error_logger:error_msg("hanoidb_idx_writer cannot open ~p: ~p~n", [Name, Error]),
@@ -113,12 +111,13 @@ init([Name,Options]) ->
 
 
 handle_cast({add, Key, {Data, TStamp}=Record}, State) when is_binary(Key), (is_binary(Data) orelse Data == ?TOMBSTONE)->
-    if TStamp < State#state.expiry_time ->
-            State2 = State;
-       true ->
-            {ok, State2} = add_record(0, Key, Record, State)
-    end,
-    {noreply, State2};
+    case hanoidb_util:has_expired(TStamp) of
+        true ->
+            {ok, State2} = add_record(0, Key, Record, State),
+            {noreply, State2};
+        false ->
+            {noreply, State}
+    end;
 
 handle_cast({add, Key, Data}, State) when is_binary(Key), (is_binary(Data) orelse Data == ?TOMBSTONE)->
     {ok, State2} = add_record(0, Key, Data, State),
