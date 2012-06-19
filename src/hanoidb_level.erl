@@ -53,7 +53,8 @@
 -record(state, {
           a, b, c, next, dir, level, inject_done_ref, merge_pid, folding = [],
           step_next_ref, step_caller, step_merge_ref,
-          opts = [], owner, work_in_progress=0, work_done=0, max_level=?TOP_LEVEL
+          opts = [], owner, work_in_progress=0, work_done=0, max_level=?TOP_LEVEL,
+          idx
           }).
 
 
@@ -168,10 +169,10 @@ initialize2(State) ->
     CFileName = filename("C",State),
     MFileName = filename("M",State),
 
-    %% remove old merge file
+    %% Remove old merge file
     file:delete( filename("X",State)),
 
-    %% remove old fold files (hard links to A/B/C used during fold)
+    %% Remove old fold files (hard links to A/B/C used during fold)
     file:delete( filename("AF",State)),
     file:delete( filename("BF",State)),
     file:delete( filename("CF",State)),
@@ -179,50 +180,53 @@ initialize2(State) ->
     case file:read_file_info(MFileName) of
         {ok, _} ->
 
-            %% recover from post-merge crash. This is the case where
-            %% a merge completed, resulting in a file that needs to
-            %% stay at the *same* level because the resulting size
-            %% is smaller than or equal to this level's files.
+            %% Recover from post-merge crash. This is the case where a merge
+            %% completed, resulting in a file that needs to stay at the *same*
+            %% level because the resulting size is smaller than or equal to
+            %% this level's files.
             file:delete(AFileName),
             file:delete(BFileName),
             ok = file:rename(MFileName, AFileName),
 
-            {ok, BTA} = hanoidb_reader:open(AFileName, [random|State#state.opts]),
+            {ok, IdxA} = hanoidb_idx_reader:open(AFileName, [random|State#state.opts]),
 
             case file:read_file_info(CFileName) of
                 {ok, _} ->
                     file:rename(CFileName, BFileName),
-                    {ok, BTB} = hanoidb_reader:open(BFileName, [random|State#state.opts]),
-                    check_begin_merge_then_loop0(init_state(State#state{ a= BTA, b=BTB }));
+                    {ok, IdxB} = hanoidb_idx_reader:open(BFileName, [random|State#state.opts]),
+                    check_begin_merge_then_loop0(init_state(State#state{ a=IdxA, b=IdxB }));
 
                 {error, enoent} ->
-                    main_loop(init_state(State#state{ a= BTA, b=undefined }))
+                    main_loop(init_state(State#state{ a=IdxA, b=undefined }))
             end;
 
         {error, enoent} ->
+
+            %% Recover from a pre-merge crash, there was no merge file on disk.
+
             case file:read_file_info(BFileName) of
                 {ok, _} ->
-                    {ok, BTA} = hanoidb_reader:open(AFileName, [random|State#state.opts]),
-                    {ok, BTB} = hanoidb_reader:open(BFileName, [random|State#state.opts]),
+                    {ok, IdxA} = hanoidb_idx_reader:open(AFileName, [random|State#state.opts]),
+                    {ok, IdxB} = hanoidb_idx_reader:open(BFileName, [random|State#state.opts]),
 
                     case file:read_file_info(CFileName) of
                         {ok, _} ->
-                            {ok, BTC} = hanoidb_reader:open(CFileName, [random|State#state.opts]);
+                            {ok, IdxC} = hanoidb_idx_reader:open(CFileName, [random|State#state.opts]);
                         {error, enoent} ->
-                            BTC = undefined
+                            IdxC = undefined
                     end,
 
-                    check_begin_merge_then_loop0(init_state(State#state{ a=BTA, b=BTB, c=BTC }));
+                    check_begin_merge_then_loop0(init_state(State#state{ a=IdxA, b=IdxB, c=IdxC }));
 
                 {error, enoent} ->
 
-                    %% assert that there is no C file
+                    %% Without a B file present, there should be no C file.
                     {error, enoent} = file:read_file_info(CFileName),
 
                     case file:read_file_info(AFileName) of
                         {ok, _} ->
-                            {ok, BTA} = hanoidb_reader:open(AFileName, [random|State#state.opts]),
-                            main_loop(init_state(State#state{ a=BTA }));
+                            {ok, IdxA} = hanoidb_idx_reader:open(AFileName, [random|State#state.opts]),
+                            main_loop(init_state(State#state{ a=IdxA }));
 
                         {error, enoent} ->
                             main_loop(init_state(State))
@@ -234,14 +238,14 @@ init_state(State) ->
     ?log("opened level ~p, state=~p", [State#state.level, State]),
     State.
 
-check_begin_merge_then_loop0(State=#state{a=BTA, b=BTB, merge_pid=undefined})
-  when BTA/=undefined, BTB /= undefined ->
+check_begin_merge_then_loop0(State=#state{a=IdxA, b=IdxB, merge_pid=undefined})
+  when IdxA /= undefined, IdxB /= undefined ->
     {ok, MergePID} = begin_merge(State),
     MergeRef = monitor(process, MergePID),
     if State#state.c == undefined ->
-            WIP = ?BTREE_SIZE(State#state.level);
+            WIP = ?IDX_LEVEL_SIZE(State#state.level);
        true ->
-            WIP = 2*?BTREE_SIZE(State#state.level)
+            WIP = ?IDX_GROWTH_FACTOR * ?IDX_LEVEL_SIZE(State#state.level)
     end,
 
     MergePID ! {step, {self(), MergeRef}, WIP},
@@ -251,9 +255,8 @@ check_begin_merge_then_loop0(State=#state{a=BTA, b=BTB, merge_pid=undefined})
 check_begin_merge_then_loop0(State) ->
     check_begin_merge_then_loop(State).
 
-
-check_begin_merge_then_loop(State=#state{a=BTA, b=BTB, merge_pid=undefined})
-  when BTA/=undefined, BTB /= undefined ->
+check_begin_merge_then_loop(State=#state{a=IdxA, b=IdxB, merge_pid=undefined})
+  when IdxA /= undefined, IdxB /= undefined ->
     {ok, MergePID} = begin_merge(State),
     main_loop(State#state{merge_pid=MergePID,work_done=0 });
 check_begin_merge_then_loop(State) ->
@@ -308,7 +311,7 @@ main_loop(State = #state{ next=Next }) ->
 
             plain_rpc:send_reply(From, ok),
 
-            case hanoidb_reader:open(ToFileName, [random|State#state.opts]) of
+            case hanoidb_idx_reader:open(ToFileName, [random|State#state.opts]) of
                 {ok, BT} ->
                     if SetPos == #state.b ->
                             check_begin_merge_then_loop(setelement(SetPos, State, BT));
@@ -540,13 +543,13 @@ main_loop(State = #state{ next=Next }) ->
                 undefined ->
                     main_loop(State2#state{ merge_pid=undefined });
                 CFile ->
-                    ok = hanoidb_reader:close(CFile),
+                    ok = hanoidb_idx_reader:close(CFile),
                     ok = file:rename(filename("C", State2), filename("A", State2)),
-                    {ok, AFile} = hanoidb_reader:open(filename("A", State2), [random|State#state.opts]),
+                    {ok, AFile} = hanoidb_idx_reader:open(filename("A", State2), [random|State#state.opts]),
                     main_loop(State2#state{ a = AFile, c = undefined, merge_pid=undefined })
             end;
 
-        ?CAST(_From,{merge_done, Count, OutFileName}) when Count =< ?BTREE_SIZE(State#state.level) ->
+        ?CAST(_From,{merge_done, Count, OutFileName}) when Count =< ?IDX_LEVEL_SIZE(State#state.level) ->
 
             ?log("merge_done, out:~w~n -> self", [Count]),
 
@@ -560,7 +563,7 @@ main_loop(State = #state{ next=Next }) ->
             % then, rename M to A, and open it
             AFileName = filename("A",State2),
             ok = file:rename(MFileName, AFileName),
-            {ok, AFile} = hanoidb_reader:open(AFileName, [random|State#state.opts]),
+            {ok, AFile} = hanoidb_idx_reader:open(AFileName, [random|State#state.opts]),
 
             % iff there is a C file, then move it to B position
             % TODO: consider recovery for this
@@ -568,9 +571,9 @@ main_loop(State = #state{ next=Next }) ->
                 undefined ->
                     main_loop(State2#state{ a=AFile, b=undefined, merge_pid=undefined });
                 CFile ->
-                    ok = hanoidb_reader:close(CFile),
+                    ok = hanoidb_idx_reader:close(CFile),
                     ok = file:rename(filename("C", State2), filename("B", State2)),
-                    {ok, BFile} = hanoidb_reader:open(filename("B", State2), [random|State#state.opts]),
+                    {ok, BFile} = hanoidb_idx_reader:open(filename("B", State2), [random|State#state.opts]),
                     check_begin_merge_then_loop(State2#state{ a=AFile, b=BFile, c=undefined,
                                                               merge_pid=undefined })
             end;
@@ -651,7 +654,7 @@ main_loop(State = #state{ next=Next }) ->
 
 do_step(StepFrom, PreviousWork, StepSize, State) ->
     if (State#state.b =/= undefined) andalso (State#state.merge_pid =/= undefined) ->
-            WorkLeftHere = max(0, (2 * ?BTREE_SIZE(State#state.level)) - State#state.work_done);
+            WorkLeftHere = max(0, (2 * ?IDX_LEVEL_SIZE(State#state.level)) - State#state.work_done);
        true ->
             WorkLeftHere = 0
     end,
@@ -716,7 +719,7 @@ total_unmerged(State) ->
 %        + (if State#state.c == undefined -> 0; true -> 1 end)
 ,
 
-    Files * 1 * ?BTREE_SIZE( State#state.level ).
+    Files * 1 * ?IDX_LEVEL_SIZE( State#state.level ).
 
 
 
@@ -727,7 +730,7 @@ do_lookup(_Key, [Pid]) when is_pid(Pid) ->
 do_lookup(Key, [undefined|Rest]) ->
     do_lookup(Key, Rest);
 do_lookup(Key, [BT|Rest]) ->
-    case hanoidb_reader:lookup(BT, Key) of
+    case hanoidb_idx_reader:lookup(BT, Key) of
         {ok, ?TOMBSTONE} ->
             not_found;
         {ok, Result} ->
@@ -737,10 +740,10 @@ do_lookup(Key, [BT|Rest]) ->
     end.
 
 close_if_defined(undefined) -> ok;
-close_if_defined(BT)        -> hanoidb_reader:close(BT).
+close_if_defined(BT)        -> hanoidb_idx_reader:close(BT).
 
 destroy_if_defined(undefined) -> ok;
-destroy_if_defined(BT)        -> hanoidb_reader:destroy(BT).
+destroy_if_defined(BT)        -> hanoidb_idx_reader:destroy(BT).
 
 stop_if_defined(undefined) -> ok;
 stop_if_defined(MergePid) when is_pid(MergePid) ->
@@ -768,7 +771,7 @@ begin_merge(State) ->
                        ?log("merge begun~n", []),
 
                        {ok, OutCount} = hanoidb_merger:merge(AFileName, BFileName, XFileName,
-                                                           ?BTREE_SIZE(State#state.level + 1),
+                                                           ?IDX_LEVEL_SIZE(State#state.level + 1),
                                                            State#state.next =:= undefined,
                                                            State#state.opts ),
 
@@ -788,8 +791,8 @@ close_and_delete_a_and_b(State) ->
     AFileName = filename("A",State),
     BFileName = filename("B",State),
 
-    ok = hanoidb_reader:close(State#state.a),
-    ok = hanoidb_reader:close(State#state.b),
+    ok = hanoidb_idx_reader:close(State#state.a),
+    ok = hanoidb_idx_reader:close(State#state.b),
 
     ok = file:delete(AFileName),
     ok = file:delete(BFileName),
@@ -808,10 +811,10 @@ start_range_fold(FileName, WorkerPID, Range, State) ->
 try
                                 ?log("start_range_fold ~p on ~p -> ~p", [self, FileName, WorkerPID]),
                                 erlang:link(WorkerPID),
-                                {ok, File} = hanoidb_reader:open(FileName, [folding|State#state.opts]),
+                                {ok, File} = hanoidb_idx_reader:open(FileName, [folding|State#state.opts]),
                                 do_range_fold2(File, WorkerPID, self(), Range),
                                 erlang:unlink(WorkerPID),
-                                hanoidb_reader:close(File),
+                                hanoidb_idx_reader:close(File),
 
                                 %% this will release the pinning of the fold file
                                 Owner  ! {range_fold_done, self(), FileName},
@@ -823,12 +826,12 @@ end
                         end ),
     {ok, PID}.
 
--spec do_range_fold(BT        :: hanoidb_reader:read_file(),
+-spec do_range_fold(BT        :: hanoidb_idx_reader:read_file(),
                     WorkerPID :: pid(),
                     SelfOrRef :: pid() | reference(),
                     Range     :: #key_range{} ) -> ok.
 do_range_fold(BT, WorkerPID, SelfOrRef, Range) ->
-    case hanoidb_reader:range_fold(fun(Key,Value,_) ->
+    case hanoidb_idx_reader:range_fold(fun(Key,Value,_) ->
                                              WorkerPID ! {level_result, SelfOrRef, Key, Value},
                                              ok
                                      end,
@@ -846,12 +849,12 @@ do_range_fold(BT, WorkerPID, SelfOrRef, Range) ->
 
 -define(FOLD_CHUNK_SIZE, 100).
 
--spec do_range_fold2(BT        :: hanoidb_reader:read_file(),
+-spec do_range_fold2(BT        :: hanoidb_idx_reader:read_file(),
                     WorkerPID :: pid(),
                     SelfOrRef :: pid() | reference(),
                     Range     :: #key_range{} ) -> ok.
 do_range_fold2(BT, WorkerPID, SelfOrRef, Range) ->
-    try hanoidb_reader:range_fold(fun(Key,Value,{0,KVs}) ->
+    try hanoidb_idx_reader:range_fold(fun(Key,Value,{0,KVs}) ->
                                          send(WorkerPID, SelfOrRef, [{Key,Value}|KVs]),
                                          {?FOLD_CHUNK_SIZE-1, []};
                                     (Key,Value,{N,KVs}) ->

@@ -39,17 +39,16 @@
 
 -define(LOGFILENAME(Dir), filename:join(Dir, "nursery.log")).
 
-%% do incremental merge every this many inserts
-%% this value *must* be less than or equal to
-%% 2^TOP_LEVEL == ?BTREE_SIZE(?TOP_LEVEL)
--define(INC_MERGE_STEP, ?BTREE_SIZE(?TOP_LEVEL)/2).
+%% Do incremental merge every this many inserts this value *must* be less than
+%% or equal to 2^TOP_LEVEL == ?IDX_LEVEL_SIZE(?TOP_LEVEL)
+-define(INC_MERGE_STEP, ?IDX_LEVEL_SIZE(?TOP_LEVEL)/2).
 
 new(Directory, MaxLevel, Config) ->
     hanoidb_util:ensure_expiry(Config),
 
     {ok, File} = file:open( ?LOGFILENAME(Directory),
                             [raw, exclusive, write, delayed_write, append]),
-    {ok, #nursery{ log_file=File, dir=Directory, cache= gb_trees:empty(),
+    {ok, #nursery{ log_file=File, dir=Directory, cache=gb_trees:empty(),
                    max_level=MaxLevel, config=Config }}.
 
 
@@ -121,7 +120,7 @@ add(Nursery=#nursery{ log_file=File, cache=Cache, total_size=TotalSize, count=Co
         do_inc_merge(Nursery1#nursery{ cache=Cache2, total_size=TotalSize+erlang:iolist_size(Data),
                                        count=Count+1 }, 1, Top),
     if
-       Count+1 >= ?BTREE_SIZE(?TOP_LEVEL) ->
+       Count+1 >= ?IDX_LEVEL_SIZE(?TOP_LEVEL) ->
             {full, Nursery2};
        true ->
             {ok, Nursery2}
@@ -182,15 +181,15 @@ finish(#nursery{ dir=Dir, cache=Cache, log_file=LogFile,
         N when N>0 ->
             %% next, flush cache to a new BTree
             BTreeFileName = filename:join(Dir, "nursery.data"),
-            {ok, BT} = hanoidb_writer:open(BTreeFileName, [{size,?BTREE_SIZE(?TOP_LEVEL)},
+            {ok, BT} = hanoidb_idx_writer:open(BTreeFileName, [{size,?IDX_LEVEL_SIZE(?TOP_LEVEL)},
                                                            {compress, none} | Config ]),
             try
                 lists:foreach( fun({Key,Value}) ->
-                                       ok = hanoidb_writer:add(BT, Key, Value)
+                                       ok = hanoidb_idx_writer:add(BT, Key, Value)
                                end,
                                gb_trees:to_list(Cache))
             after
-                ok = hanoidb_writer:close(BT)
+                ok = hanoidb_idx_writer:close(BT)
             end,
 
 %            {ok, FileInfo} = file:read_file_info(BTreeFileName),
@@ -203,10 +202,10 @@ finish(#nursery{ dir=Dir, cache=Cache, log_file=LogFile,
 
             %% issue some work if this is a top-level inject (blocks until previous such
             %% incremental merge is finished).
-            if DoneMerge >= ?BTREE_SIZE(?TOP_LEVEL) ->
+            if DoneMerge >= ?IDX_LEVEL_SIZE(?TOP_LEVEL) ->
                     ok;
                true ->
-                    hanoidb_level:begin_incremental_merge(TopLevel, ?BTREE_SIZE(?TOP_LEVEL) - DoneMerge)
+                    hanoidb_level:begin_incremental_merge(TopLevel, ?IDX_LEVEL_SIZE(?TOP_LEVEL) - DoneMerge)
             end;
 
         _ ->
@@ -245,7 +244,7 @@ flush(Nursery=#nursery{ dir=Dir, max_level=MaxLevel, config=Config }, Top) ->
     hanoidb_nursery:new(Dir, MaxLevel, Config).
 
 has_room(#nursery{ count=Count }, N) ->
-    (Count+N) < ?BTREE_SIZE(?TOP_LEVEL).
+    (Count+N) < ?IDX_LEVEL_SIZE(?TOP_LEVEL).
 
 ensure_space(Nursery, NeededRoom, Top) ->
     case has_room(Nursery, NeededRoom) of

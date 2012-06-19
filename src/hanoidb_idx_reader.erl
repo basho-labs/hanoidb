@@ -22,8 +22,12 @@
 %%
 %% ----------------------------------------------------------------------------
 
--module(hanoidb_reader).
+-module(hanoidb_idx_reader).
 -author('Kresten Krab Thorup <krab@trifork.com>').
+
+%%
+%% Streaming index file reader.
+%%
 
 -include_lib("kernel/include/file.hrl").
 -include("include/hanoidb.hrl").
@@ -37,7 +41,7 @@
 -export([serialize/1, deserialize/1]).
 
 -record(node, { level, members=[] }).
--record(index, {file, root, bloom, name, config=[]}).
+-record(index, {file, idxmgr, idxstate, name, config=[]}).
 
 -type read_file() :: #index{}.
 
@@ -48,7 +52,6 @@ open(Name) ->
 -type config() :: [sequential | folding | random | {atom(), term()}].
 
 -spec open(Name::string(), config()) -> read_file().
-
 open(Name, Config) ->
     case proplists:get_bool(sequential, Config) of
         true ->
@@ -67,27 +70,28 @@ open(Name, Config) ->
 
             {ok, FileInfo} = file:read_file_info(Name),
 
-            %% read and validate magic tag
-            {ok, <<"HAN1">>} = file:pread(File, 0, 4),
+            %% Read and validate magic tag.
+            {ok, <<"HAN2", IdxTagLen:integer-unsigned>>} = file:pread(File, 0, 4 + byte_size(<<1/integer-unsigned>>)),
+            IdxMgr = idx_type(file:pread(File, 4, IdxTagLen)),
 
-            %% read root position
-            {ok, <<RootPos:64/unsigned>>} = file:pread(File, FileInfo#file_info.size-8, 8),
-            {ok, <<BloomSize:32/unsigned>>} = file:pread(File, FileInfo#file_info.size-12, 4),
-            {ok, BloomData} = file:pread(File, FileInfo#file_info.size-12-BloomSize ,BloomSize),
+            IdxState = case IdxMgr:init(File, 4 + byte_size(<<1/integer-unsigned>>) +  IdxTagLen) of
+                      {ok, IdxState} ->
+                          IdxState;
+                      _ ->
+                          {error, index_mgr_failed_to_init}
+% TODO          {error, run_recovery}
+% TODO          {error, corrupt}
+                  end,
 
-            {ok, Bloom} = ebloom:deserialize(zlib:unzip(BloomData)),
-
-            %% suck in the root
-            {ok, Root} = read_node(File, RootPos),
-
-            {ok, #index{file=File, root=Root, bloom=Bloom, name=Name, config=Config}}
+            {ok, #index{file=File, idxmgr=IdxMgr, idxstate=IdxState, name=Name, config=Config}}
     end.
 
-destroy(#index{file=File, name=Name}) ->
+destroy(#index{file=File, name=Name, idxmgr=IdxMgr, idxstate=IdxState}) ->
+    ok = IdxMgr:destroy(IdxState),
     ok = file:close(File),
     file:delete(Name).
 
-serialize(#index{file=File, bloom=undefined }=Index) ->
+serialize(#index{file=File}=Index) ->
     {ok, Position} = file:position(File, cur),
     ok = file:close(File),
     {seq_read_file, Index, Position}.
@@ -98,37 +102,21 @@ deserialize({seq_read_file, Index, Position}) ->
     Index2.
 
 
+filter(Pred, L) -> lists:reverse(filter(Pred, L,[])).
 
-fold(Fun, Acc0, #index{file=File}) ->
-    {ok, Node} = read_node(File,?FIRST_BLOCK_POS),
-    fold0(File,fun({K,V},Acc) -> Fun(K,V,Acc) end,Node,Acc0).
-
-fold0(File,Fun,#node{level=0,members=List},Acc0) ->
-    Acc1 = lists:foldl(Fun,Acc0,List),
-    fold1(File,Fun,Acc1);
-fold0(File,Fun,_InnerNode,Acc0) ->
-    fold1(File,Fun,Acc0).
-
-fold1(File,Fun,Acc0) ->
-    case next_leaf_node(File) of
-        eof ->
-            Acc0;
-        {ok, Node} ->
-            fold0(File,Fun,Node,Acc0)
+filter(_, [], Acc) -> Acc;
+filter(Pred, [H|T], Acc) ->
+    case Pred(H) of
+        true  -> filter(Pred, T, [H|Acc]);
+        false -> filter(Pred, T, Acc)
     end.
 
-range_fold(Fun, Acc0, #index{file=File,root=Root,config=Options}, Range) ->
+fold(Fun, Acc0, #index{idxmgr=IdxMgr, idxstate=IdxState}) ->
+    IdxMgr:fold(Fun, Acc0, IdxState).
+
+range_fold(Fun, Acc, #index{idxmgr=IdxMgr, idxstate=IdxState, config=Options}, Range) ->
     ExpiryTime = hanoidb_util:expiry_time(Options),
-    case lookup_node(File,Range#key_range.from_key,Root,?FIRST_BLOCK_POS) of
-        {ok, {Pos,_}} ->
-            file:position(File, Pos),
-            do_range_fold(Fun, Acc0, File, Range, Range#key_range.limit, ExpiryTime);
-        {ok, Pos} ->
-            file:position(File, Pos),
-            do_range_fold(Fun, Acc0, File, Range, Range#key_range.limit, ExpiryTime);
-        none ->
-            {done, Acc0}
-    end.
+    IdxMgr:range_fold(FilterFun, Acc, IdxState, Range, FilterFun).
 
 fold_until_stop(Fun,Acc,List) ->
     fold_until_stop2(Fun, {continue, Acc}, List).
@@ -139,6 +127,12 @@ fold_until_stop2(_Fun,{continue, Acc},[]) ->
     {ok, Acc};
 fold_until_stop2(Fun,{continue, Acc},[H|T]) ->
     fold_until_stop2(Fun,Fun(H,Acc),T).
+
+if_not_expired(Fun, ExpiryTime, Key, Value) ->
+    case is_expired(Value, ExpiryTime) of
+        false -> Fun(Key, Val);
+        true -> ok
+    end.
 
 is_expired({_Value, TStamp}, ExpiryTime) ->
     TStamp < ExpiryTime ;
@@ -222,40 +216,6 @@ do_range_fold(Fun, Acc0, File, Range, N0, ExpiryTime) ->
             end
     end.
 
-lookup_node(_File,_FromKey,#node{level=0},Pos) ->
-    {ok, Pos};
-lookup_node(File,FromKey,#node{members=Members,level=N},_) ->
-    case find_start(FromKey, Members) of
-        {ok, ChildPos} when N==1 ->
-            {ok, ChildPos};
-        {ok, ChildPos} ->
-            case read_node(File,ChildPos) of
-                {ok, ChildNode} ->
-                    lookup_node(File,FromKey,ChildNode,ChildPos);
-                eof ->
-                    none
-            end;
-        not_found ->
-            none
-    end.
-
-
-
-first_node(#index{file=File}) ->
-    case read_node(File, ?FIRST_BLOCK_POS) of
-        {ok, #node{level=0, members=Members}} ->
-            {node, Members}
-    end.
-
-next_node(#index{file=File}=_Index) ->
-    case next_leaf_node(File) of
-        {ok, #node{level=0, members=Members}} ->
-            {node, Members};
-%        {ok, #node{level=N}} when N>0 ->
-%            next_node(Index);
-        eof ->
-            end_of_data
-    end.
 
 close(#index{file=File}) ->
     file:close(File).
@@ -354,43 +314,3 @@ find_start(_, [{_,{_,_}=V}]) ->
     {ok, V};
 find_start(K, KVs) ->
     find_1(K, KVs).
-
-
-
-
-read_node(File,{Pos,Size}) ->
-%   error_logger:info_msg("read_node ~p ~p ~p~n", [File, Pos, Size]),
-    {ok, <<_:32, Level:16/unsigned, Data/binary>>} = file:pread(File, Pos, Size),
-    hanoidb_util:decode_index_node(Level, Data);
-
-read_node(File,Pos) ->
-    {ok, Pos} = file:position(File, Pos),
-    Result = read_node(File),
-%   error_logger:info_msg("decoded ~p ~p~n", [Pos, Result]),
-    Result.
-
-read_node(File) ->
-    {ok, <<Len:32, Level:16/unsigned>>} = file:read(File, 6),
-    case Len of
-        0 -> eof;
-        _ ->
-            {ok, Data} = file:read(File, Len-2),
-            hanoidb_util:decode_index_node(Level, Data)
-    end.
-
-
-next_leaf_node(File) ->
-    case file:read(File, 6) of
-        eof ->
-            %% premature end-of-file
-            eof;
-        {ok, <<0:32, _:16>>} ->
-            eof;
-        {ok, <<Len:32, 0:16>>} ->
-            {ok, Data} = file:read(File, Len-2),
-            hanoidb_util:decode_index_node(0, Data);
-        {ok, <<Len:32, _:16>>} ->
-            {ok, _} = file:position(File, {cur,Len-2}),
-            next_leaf_node(File)
-    end.
-

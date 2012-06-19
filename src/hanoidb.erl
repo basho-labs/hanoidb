@@ -307,7 +307,7 @@ open_levels(Dir,Options) ->
                      {undefined, 0},
                      lists:seq(MaxLevel, min(?TOP_LEVEL, MinLevel), -1)),
 
-    WorkPerIter = (MaxLevel-MinLevel+1)*?BTREE_SIZE(?TOP_LEVEL),
+    WorkPerIter = (MaxLevel-MinLevel+1)*?IDX_LEVEL_SIZE(?TOP_LEVEL),
     do_merge(TopLevel, WorkPerIter, MaxMerge),
 
     {ok, TopLevel, MaxLevel}.
@@ -316,7 +316,7 @@ do_merge(TopLevel, _Inc, N) when N =< 0 ->
     ok = hanoidb_level:await_incremental_merge(TopLevel);
 
 do_merge(TopLevel, Inc, N) ->
-    ok = hanoidb_level:begin_incremental_merge(TopLevel, ?BTREE_SIZE(?TOP_LEVEL)),
+    ok = hanoidb_level:begin_incremental_merge(TopLevel, ?IDX_LEVEL_SIZE(?TOP_LEVEL)),
     do_merge(TopLevel, Inc, N-Inc).
 
 

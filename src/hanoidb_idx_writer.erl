@@ -22,14 +22,14 @@
 %%
 %% ----------------------------------------------------------------------------
 
--module(hanoidb_writer).
+-module(hanoidb_idx_writer).
 -author('Kresten Krab Thorup <krab@trifork.com>').
-
--include("hanoidb.hrl").
 
 %%
 %% Streaming btree writer. Accepts only monotonically increasing keys for put.
 %%
+
+-include("hanoidb.hrl").
 
 -define(NODE_SIZE, 8*1024).
 
@@ -99,7 +99,7 @@ init([Name,Options]) ->
             {ok, BloomFilter} = ebloom:new(erlang:min(Size,16#ffffffff), 0.01, 123),
             BlockSize = hanoidb:get_opt(block_size, Options, ?NODE_SIZE),
             {ok, #state{ name=Name,
-                         index_file_pos=?FIRST_BLOCK_POS, index_file=IdxFile,
+                         index_file_pos=?IDX_GROWTH_FACTOR, index_file=IdxFile,
                          bloom = BloomFilter,
                          block_size = BlockSize,
                          compress = hanoidb:get_opt(compress, Options, none),
@@ -107,7 +107,7 @@ init([Name,Options]) ->
                          expiry_time = hanoidb_util:expiry_time(Options)
                        }};
         {error, _}=Error ->
-            error_logger:error_msg("hanoidb_writer cannot open ~p: ~p~n", [Name, Error]),
+            error_logger:error_msg("hanoidb_idx_writer cannot open ~p: ~p~n", [Name, Error]),
             {stop, Error}
     end.
 
@@ -192,7 +192,7 @@ flush_nodes(#state{ nodes=[], last_node_pos=LastNodePos, last_node_size=_LastNod
     if LastNodePos =:= undefined ->
             %% store contains no entries!
             ok = file:write(IdxFile, <<0:32,0:16>>),
-            RootPos = ?FIRST_BLOCK_POS;
+            RootPos = ?IDX_GROWTH_FACTOR;
        true ->
             RootPos = LastNodePos
     end,
