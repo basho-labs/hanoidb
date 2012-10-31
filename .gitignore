@@ -2,4 +2,6 @@ ebin
 deps
 *~
 .eunit
+.test
 .project
+.hanoidb.plt

@@ -1,3 +1,5 @@
+TARGET=		hanoidb
+
 REBAR=		rebar
 DIALYZER=	dialyzer
 
@@ -29,18 +31,10 @@ clean-test-btrees:
 	rm -fr .eunit/Btree_* .eunit/simple
 
 plt: compile
-	$(DIALYZER) --build_plt --output_plt .hanoi.plt \
-		-pa deps/plain_fsm/ebin \
-		-pa deps/ebloom/ebin \
-		deps/plain_fsm/ebin \
-		deps/ebloom/ebin \
-		--apps kernel stdlib
+	$(DIALYZER) --build_plt --output_plt .$(TARGET).plt -pa deps/*/ebin --apps kernel stdlib
 
-analyze: compile
-	$(DIALYZER) --plt .hanoi.plt \
-	-pa deps/plain_fsm/ebin \
-	-pa deps/ebloom/ebin \
-	ebin
+analyze:
+	$(DIALYZER) --plt .$(TARGET).plt -pa deps/*/ebin ebin
 
 repl:
 	erl -pz deps/*/ebin -pa ebin
