@@ -32,5 +32,11 @@
                   stdlib
                  ]},
   {mod, {hanoidb_app, []}},
-  {env, []}
+  {env, [{expiry_secs, 0},
+         {merge_strategy, fast},
+         {read_buffer_size, 524288},
+         {write_buffer_size,524288},
+         {block_size, 8096},
+         {compress, none}
+        ]}
  ]}.
