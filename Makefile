@@ -36,5 +36,8 @@ plt: compile
 analyze:
 	$(DIALYZER) --plt .$(TARGET).plt -pa deps/*/ebin ebin
 
+analyze-nospec:
+	$(DIALYZER) --plt .$(TARGET).plt -pa deps/*/ebin --no_spec ebin
+
 repl:
 	erl -pz deps/*/ebin -pa ebin

@@ -31,7 +31,8 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
--export([open/1, open/2, transact/2, close/1, get/2, lookup/2, delete/2, put/3, put/4,
+-export([open/1, open/2, open/3, open_link/1, open_link/2, open_link/3,
+         transact/2, close/1, get/2, lookup/2, delete/2, put/3, put/4,
          fold/3, fold_range/4, destroy/1]).
 
 -export([get_opt/2, get_opt/3]).
@@ -41,8 +42,8 @@
 -include_lib("include/hanoidb.hrl").
 -include_lib("include/plain_rpc.hrl").
 
--record(state, { top       :: pos_integer(),
-                 nursery   :: term(),
+-record(state, { top       :: pid(),
+                 nursery   :: #nursery{},
                  dir       :: string(),
                  opt       :: term(),
                  max_level :: pos_integer()}).
@@ -61,28 +62,63 @@
 
 -type hanoidb() :: pid().
 -type key_range() :: #key_range{}.
--type config_option() :: {compress, none | gzip | snappy} %lz4
+-type config_option() :: {compress, none | gzip | snappy | lz4}
                        | {page_size, pos_integer()}
                        | {read_buffer_size, pos_integer()}
                        | {write_buffer_size, pos_integer()}
                        | {merge_strategy, fast | predictable }
                        | {sync_strategy, none | sync | {seconds, pos_integer()}}
                        | {expiry_secs, non_neg_integer()}
+                       | {spawn_opt, list()}
                        .
 
 %% @doc
 %% Create or open a hanoidb store.  Argument `Dir' names a
 %% directory in which to keep the data files.  By convention, we
 %% name hanoidb data directories with extension ".hanoidb".
-- spec open(Dir::string()) -> hanoidb().
+- spec open(Dir::string()) -> {ok, hanoidb()} | ignore | {error, term()}.
 open(Dir) ->
     open(Dir, []).
 
 %% @doc Create or open a hanoidb store.
-- spec open(Dir::string(), Opts::[config_option()]) -> hanoidb().
+- spec open(Dir::string(), Opts::[config_option()]) -> {ok, hanoidb()} | ignore | {error, term()}.
 open(Dir, Opts) ->
     ok = start_app(),
-    gen_server:start(?MODULE, [Dir, Opts], []).
+    SpawnOpt = hanoidb:get_opt(spawn_opt, Opts, []),
+    gen_server:start(?MODULE, [Dir, Opts], [{spawn_opt,SpawnOpt}]).
+
+%% @doc Create or open a hanoidb store with a registered name.
+- spec open(Name::{local, Name::atom()} | {global, GlobalName::term()} | {via, ViaName::term()},
+            Dir::string(), Opts::[config_option()]) -> {ok, hanoidb()} | ignore | {error, term()}.
+open(Name, Dir, Opts) ->
+    ok = start_app(),
+    SpawnOpt = hanoidb:get_opt(spawn_opt, Opts, []),
+    gen_server:start(Name, ?MODULE, [Dir, Opts], [{spawn_opt,SpawnOpt}]).
+
+%% @doc
+%% Create or open a hanoidb store as part of a supervision tree.
+%% Argument `Dir' names a directory in which to keep the data files.
+%% By convention, we name hanoidb data directories with extension
+%% ".hanoidb".
+- spec open_link(Dir::string()) -> {ok, hanoidb()} | ignore | {error, term()}.
+open_link(Dir) ->
+    open_link(Dir, []).
+
+%% @doc Create or open a hanoidb store as part of a supervision tree.
+- spec open_link(Dir::string(), Opts::[config_option()]) -> {ok, hanoidb()} | ignore | {error, term()}.
+open_link(Dir, Opts) ->
+    ok = start_app(),
+    SpawnOpt = hanoidb:get_opt(spawn_opt, Opts, []),
+    gen_server:start_link(?MODULE, [Dir, Opts], [{spawn_opt,SpawnOpt}]).
+
+%% @doc Create or open a hanoidb store as part of a supervision tree
+%% with a registered name.
+- spec open_link(Name::{local, Name::atom()} | {global, GlobalName::term()} | {via, ViaName::term()},
+                 Dir::string(), Opts::[config_option()]) -> {ok, hanoidb()} | ignore | {error, term()}.
+open_link(Name, Dir, Opts) ->
+    ok = start_app(),
+    SpawnOpt = hanoidb:get_opt(spawn_opt, Opts, []),
+    gen_server:start_link(Name, ?MODULE, [Dir, Opts], [{spawn_opt,SpawnOpt}]).
 
 %% @doc
 %% Close a Hanoi data store.
@@ -277,7 +313,7 @@ open_levels(Dir, Options) ->
 
     %% remove old nursery data file
     NurseryFileName = filename:join(Dir, "nursery.data"),
-    file:delete(NurseryFileName),
+    _ = file:delete(NurseryFileName),
 
     %% Do enough incremental merge to be sure we won't deadlock in insert
     {TopLevel, MaxMerge} =
@@ -314,7 +350,7 @@ handle_info({bottom_level, N}, #state{ nursery=Nursery, top=TopLevel }=State)
     State2 = State#state{ max_level = N,
                           nursery= hanoidb_nursery:set_max_level(Nursery, N) },
 
-    hanoidb_level:set_max_level(TopLevel, N),
+    _ = hanoidb_level:set_max_level(TopLevel, N),
 
     {noreply, State2};
 
@@ -367,9 +403,12 @@ handle_call({get, Key}, From, State=#state{ top=Top, nursery=Nursery } ) when is
         {value, Value} when is_binary(Value) ->
             {reply, {ok, Value}, State};
         none ->
-            hanoidb_level:lookup(Top, Key, fun(Reply) -> gen_server:reply(From, Reply) end),
+            _ = hanoidb_level:lookup(Top, Key, fun(Reply) -> gen_server:reply(From, Reply) end),
             {noreply, State}
     end;
+
+handle_call(close, _From, State=#state{ nursery=undefined }) ->
+    {stop, normal, ok, State};
 
 handle_call(close, _From, State=#state{ nursery=Nursery, top=Top, dir=Dir, max_level=MaxLevel, opt=Config }) ->
     try
@@ -388,8 +427,8 @@ handle_call(destroy, _From, State=#state{top=Top, nursery=Nursery }) ->
     ok = hanoidb_level:destroy(Top),
     {stop, normal, ok, State#state{ top=undefined, nursery=undefined, max_level=?TOP_LEVEL }}.
 
-
-do_put(Key, Value, Expiry, State=#state{ nursery=Nursery, top=Top }) ->
+-spec do_put(key(), value(), expiry(), #state{}) -> {ok, #state{}}.
+do_put(Key, Value, Expiry, State=#state{ nursery=Nursery, top=Top }) when Nursery =/= undefined ->
     {ok, Nursery2} = hanoidb_nursery:add(Key, Value, Expiry, Nursery, Top),
     {ok, State#state{nursery=Nursery2}}.
 

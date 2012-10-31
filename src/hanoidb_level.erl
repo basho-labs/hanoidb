@@ -80,12 +80,14 @@ debug_log(State,Fmt,Args) ->
 
 open(Dir,Level,Next,Opts,Owner) when Level>0 ->
     hanoidb_util:ensure_expiry(Opts),
-    PID = plain_fsm:spawn(?MODULE,
+    SpawnOpt = hanoidb:get_opt(spawn_opt, Opts, []),
+    PID = plain_fsm:spawn_opt(?MODULE,
                               fun() ->
                                       process_flag(trap_exit,true),
                                       link(Owner),
                                       initialize(#state{dir=Dir,level=Level,next=Next,opts=Opts,owner=Owner})
-                              end),
+                              end,
+                              SpawnOpt),
     {ok, PID}.
 
 lookup(Ref, Key) ->
@@ -439,10 +441,10 @@ main_loop(State = #state{ next=Next }) ->
 
             ?log("init_range_fold ~p -> ~p", [Range, WorkerPID]),
 
-            {FoldingPIDs, NextList} =
+            {NextList, FoldingPIDs} =
             case {State#state.a, State#state.b, State#state.c} of
                 {undefined, undefined, undefined} ->
-                    {[], List};
+                    {List, []};
 
                 {_, undefined, undefined} ->
                     ok = file:make_link(filename("A", State), filename("AF", State)),
@@ -546,7 +548,10 @@ main_loop(State = #state{ next=Next }) ->
                     main_loop(State2#state{ a = AFile, c = undefined, merge_pid=undefined })
             end;
 
-        ?CAST(_From,{merge_done, Count, OutFileName}) when Count =< ?BTREE_SIZE(State#state.level) ->
+        ?CAST(_From,{merge_done, Count, OutFileName})
+          when Count =< ?BTREE_SIZE(State#state.level),
+               State#state.c =:= undefined,
+               Next =:= undefined ->
 
             ?log("merge_done, out:~w~n -> self", [Count]),
 
@@ -666,17 +671,17 @@ do_step(StepFrom, PreviousWork, StepSize, State) ->
     %% heuristic doesn't work when there are aggressive deletes (expiry or delete).
     %% https://github.com/basho/hanoidb/issues/7
     WorkToDoHere =
-        min(WorkLeftHere, WorkUnitsLeft),
-        %% case hanoidb:get_opt( merge_strategy, State#state.opts, fast) of
-        %%     fast ->
-        %%         min(WorkLeftHere, WorkUnitsLeft);
-        %%     predictable ->
-        %%         if (WorkLeftHere < Depth * WorkUnit) ->
-        %%                 min(WorkLeftHere, WorkUnit);
-        %%            true ->
-        %%                 min(WorkLeftHere, WorkUnitsLeft)
-        %%         end
-        %% end,
+        %% min(WorkLeftHere, WorkUnitsLeft),
+        case hanoidb:get_opt( merge_strategy, State#state.opts, fast) of
+            fast ->
+                min(WorkLeftHere, WorkUnitsLeft);
+            predictable ->
+                if (WorkLeftHere < Depth * WorkUnit) ->
+                        min(WorkLeftHere, WorkUnit);
+                   true ->
+                        min(WorkLeftHere, WorkUnitsLeft)
+                end
+        end,
     WorkIncludingHere  = PreviousWork + WorkToDoHere,
 
     ?log("do_step prev:~p, do:~p of ~p ~n", [PreviousWork, WorkToDoHere, WorkLeftHere]),
@@ -818,7 +823,7 @@ start_range_fold(FileName, WorkerPID, Range, State) ->
     Owner = self(),
     PID = proc_lib:spawn( fun() ->
           try
-              ?log("start_range_fold ~p on ~p -> ~p", [self, FileName, WorkerPID]),
+              ?log("start_range_fold ~p on ~p -> ~p", [self(), FileName, WorkerPID]),
               erlang:link(WorkerPID),
               {ok, File} = hanoidb_reader:open(FileName, [folding|State#state.opts]),
               do_range_fold2(File, WorkerPID, self(), Range),
@@ -848,13 +853,13 @@ do_range_fold(BT, WorkerPID, SelfOrRef, Range) ->
                                      BT,
                                      Range) of
         {limit, _, LastKey} ->
-            WorkerPID ! {level_limit, SelfOrRef, LastKey};
+            WorkerPID ! {level_limit, SelfOrRef, LastKey},
+            ok;
         {done, _} ->
             %% tell fold merge worker we're done
-            WorkerPID ! {level_done, SelfOrRef}
-
-    end,
-    ok.
+            WorkerPID ! {level_done, SelfOrRef},
+            ok
+    end.
 
 -define(FOLD_CHUNK_SIZE, 100).
 

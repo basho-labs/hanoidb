@@ -32,9 +32,6 @@
 -include("hanoidb.hrl").
 -include_lib("kernel/include/file.hrl").
 
--record(nursery, { log_file, dir, cache, total_size=0, count=0,
-                   last_sync=now(), max_level, config=[], step=0, merge_done=0 }).
-
 -spec new(string(), integer(), [_]) -> {ok, #nursery{}} | {error, term()}.
 
 -define(LOGFILENAME(Dir), filename:join(Dir, "nursery.log")).
@@ -91,15 +88,15 @@ read_nursery_from_log(Directory, MaxLevel, Config) ->
         case hanoidb_util:decode_crc_data(LogBinary, [], []) of
             {ok, KVs} ->
                 fill_cache(KVs, gb_trees:empty());
-            {error, _Reason} ->
+            {partial, KVs, _ErrorData} ->
                 error_logger:info_msg("ignoring undecypherable bytes in ~p~n", [?LOGFILENAME(Directory)]),
-                gb_trees:empty()
+                fill_cache(KVs, gb_trees:empty())
         end,
     {ok, #nursery{ dir=Directory, cache=Cache, count=gb_trees:size(Cache), max_level=MaxLevel, config=Config }}.
 
 %% @doc Add a Key/Value to the nursery
 %% @end
--spec do_add(#nursery{}, binary(), binary()|?TOMBSTONE, pos_integer() | infinity, pid()) -> {ok, #nursery{}}.
+-spec do_add(#nursery{}, binary(), binary()|?TOMBSTONE, non_neg_integer() | infinity, pid()) -> {ok, #nursery{}} | {full, #nursery{}}.
 do_add(Nursery, Key, Value, infinity, Top) ->
     do_add(Nursery, Key, Value, 0, Top);
 do_add(Nursery=#nursery{log_file=File, cache=Cache, total_size=TotalSize, count=Count, config=Config}, Key, Value, KeyExpiryTime, Top) ->
@@ -178,7 +175,7 @@ lookup(Key, #nursery{cache=Cache}) ->
 %% @end
 -spec finish(Nursery::#nursery{}, TopLevel::pid()) -> ok.
 finish(#nursery{ dir=Dir, cache=Cache, log_file=LogFile, merge_done=DoneMerge,
-                 count=Count, config=Config }=Nursery, TopLevel) ->
+                 count=Count, config=Config }, TopLevel) ->
 
     hanoidb_util:ensure_expiry(Config),
 
@@ -236,10 +233,11 @@ destroy(#nursery{ dir=Dir, log_file=LogFile }) ->
     file:delete(LogFileName),
     ok.
 
-
+-spec add(key(), value(), #nursery{}, pid()) -> {ok, #nursery{}}.
 add(Key, Value, Nursery, Top) ->
     add(Key, Value, infinity, Nursery, Top).
 
+-spec add(key(), value(), expiry(), #nursery{}, pid()) -> {ok, #nursery{}}.
 add(Key, Value, Expiry, Nursery, Top) ->
     case do_add(Nursery, Key, Value, Expiry, Top) of
         {ok, Nursery0} ->
@@ -248,6 +246,7 @@ add(Key, Value, Expiry, Nursery, Top) ->
             flush(Nursery0, Top)
     end.
 
+-spec flush(#nursery{}, pid()) -> {ok, #nursery{}}.
 flush(Nursery=#nursery{ dir=Dir, max_level=MaxLevel, config=Config }, Top) ->
     ok = finish(Nursery, Top),
     {error, enoent} = file:read_file_info(filename:join(Dir, "nursery.log")),
@@ -261,22 +260,41 @@ ensure_space(Nursery, NeededRoom, Top) ->
         true ->
             Nursery;
         false ->
-            flush(Nursery, Top)
+            {ok, Nursery1} = flush(Nursery, Top),
+            Nursery1
     end.
 
-transact(Spec, Nursery=#nursery{ log_file=File, cache=Cache0, total_size=TotalSize }, Top) ->
-    Nursery1 = ensure_space(Nursery, length(Spec), Top),
+transact(Spec, Nursery, Top) ->
+    transact1(Spec, ensure_space(Nursery, length(Spec), Top), Top).
 
-    TStamp = hanoidb_util:tstamp(),
-    Data = hanoidb_util:crc_encapsulate_transaction(Spec, TStamp),
+transact1(Spec, Nursery1=#nursery{ log_file=File, cache=Cache0, total_size=TotalSize, config=Config }, Top) ->
+    Expiry =
+        case hanoidb:get_opt(expiry_secs, Config) of
+            0 ->
+                infinity;
+            DatabaseExpiryTime ->
+                hanoidb_util:expiry_time(DatabaseExpiryTime)
+        end,
+
+    Data = hanoidb_util:crc_encapsulate_transaction(Spec, Expiry),
     ok = file:write(File, Data),
 
     Nursery2 = do_sync(File, Nursery1),
 
     Cache2 = lists:foldl(fun({put, Key, Value}, Cache) ->
-                                 gb_trees:enter(Key, {Value, TStamp}, Cache);
+                                 case Expiry of
+                                     infinity ->
+                                         gb_trees:enter(Key, Value, Cache);
+                                     _ ->
+                                         gb_trees:enter(Key, {Value, Expiry}, Cache)
+                                 end;
                             ({delete, Key}, Cache) ->
-                                 gb_trees:enter(Key, {?TOMBSTONE, TStamp}, Cache)
+                                 case Expiry of
+                                     infinity ->
+                                         gb_trees:enter(Key, ?TOMBSTONE, Cache);
+                                     _ ->
+                                         gb_trees:enter(Key, {?TOMBSTONE, Expiry}, Cache)
+                                 end
                          end,
                          Cache0,
                          Spec),
@@ -344,7 +362,7 @@ is_expired({_Value, TStamp}) ->
 is_expired(Bin) when is_binary(Bin) ->
     false.
 
-get_value({Value, TStamp}) when is_integer(TStamp) ->
+get_value({Value, TStamp}) when is_integer(TStamp); TStamp =:= infinity ->
     Value;
 get_value(Value) when Value =:= ?TOMBSTONE; is_binary(Value) ->
     Value.
