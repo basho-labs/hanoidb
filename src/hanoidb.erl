@@ -61,7 +61,18 @@
 %% PUBLIC API
 
 -type hanoidb() :: pid().
+
 -type key_range() :: #key_range{}.
+
+-type range_spec() :: key_range()
+                    | [{from_key, binary()}
+                       | {from_inclusive, true|false}
+                       | from_inclusive
+                       | {to_key, binary() | undefined}
+                       | {to_inclusive, true|false}
+                       | to_inclusive
+                       | {limit, pos_integer() | undefined}].
+
 -type config_option() :: {compress, none | gzip | snappy | lz4}
                        | {page_size, pos_integer()}
                        | {read_buffer_size, pos_integer()}
@@ -180,7 +191,7 @@ transact(Ref, TransactionSpec) ->
 fold(Ref,Fun,Acc0) ->
     fold_range(Ref,Fun,Acc0,#key_range{from_key= <<>>, to_key=undefined}).
 
--spec fold_range(hanoidb(),kv_fold_fun(),any(),key_range()) -> any().
+-spec fold_range(hanoidb(),kv_fold_fun(),any(), range_spec()) -> any().
 fold_range(Ref,Fun,Acc0,#key_range{limit=Limit}=Range) ->
     RangeType =
         if Limit < 10 -> blocking_range;
@@ -192,7 +203,10 @@ fold_range(Ref,Fun,Acc0,#key_range{limit=Limit}=Range) ->
     ok = gen_server:call(Ref, {RangeType, FoldWorkerPID, Range}, infinity),
     Result = receive_fold_range(MRef, FoldWorkerPID, Fun, Acc0, Limit),
     ?log("fold_range done: self:~p, result=~p~n", [self(), Result]),
-    Result.
+    Result;
+
+fold_range(Ref, Fun, Acc0, Range) ->
+    fold_range(Ref, Fun, Acc0, range_proplist_to_record(Range, #key_range{})).
 
 receive_fold_range(MRef,PID,_,Acc0, 0) ->
     erlang:exit(PID, shutdown),
@@ -465,3 +479,33 @@ get_opt(Key, Opts, Default) ->
         Value ->
             Value
     end.
+
+
+-spec range_proplist_to_record(list(), key_range()) -> key_range().
+
+range_proplist_to_record([], Record) ->
+    Record;
+
+range_proplist_to_record([{from_key, Key} | L], Record) ->
+    range_proplist_to_record(L, Record#key_range{from_key = Key});
+
+range_proplist_to_record([{from_inclusive, Key} | L], Record) ->
+    range_proplist_to_record(L, Record#key_range{from_inclusive = Key});
+
+range_proplist_to_record([from_inclusive | L], Record) ->
+    range_proplist_to_record(L, Record#key_range{from_inclusive = true});
+
+range_proplist_to_record([{to_key, Key} | L], Record) ->
+    range_proplist_to_record(L, Record#key_range{to_key = Key});
+
+range_proplist_to_record([{to_inclusive, Key} | L], Record) ->
+    range_proplist_to_record(L, Record#key_range{to_inclusive = Key});
+
+range_proplist_to_record([to_inclusive | L], Record) ->
+    range_proplist_to_record(L, Record#key_range{to_inclusive = true});
+
+range_proplist_to_record([{limit, Key} | L], Record) ->
+    range_proplist_to_record(L, Record#key_range{limit = Key});
+
+range_proplist_to_record([_ | L], Record) ->
+    range_proplist_to_record(L, Record).
