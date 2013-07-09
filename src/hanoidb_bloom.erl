@@ -63,7 +63,9 @@
 %%
 %% N - capacity
 %% E - error probability
-bloom(N) -> bloom(N, 0.001).
+bloom(L) when is_list(L), length(L) > 0 ->
+    add(L, bloom(length(L)));
+bloom(N) when is_number(N), N > 0 -> bloom(N, 0.001).
 bloom(N, E) when is_number(N), N > 0,
                  is_float(E), E > 0, E < 1,
                  N >= 4/E -> % rule of thumb; due to double hashing
@@ -154,6 +156,10 @@ all_set(Mask, I1, I, [H|T]) ->
 
 %% Adds element to set
 %%
+add([], #bloom{}=B) ->
+    B;
+add([H|T], B) ->
+    add(H, B), add(T, B);
 add(Elem, #bloom{mb=Mb} = B) ->
     Hashes = make_hashes(Mb, Elem),
     hash_add(Hashes, B);
@@ -183,14 +189,16 @@ set_bits(Mask, I1, I, [H|T], Acc) ->
 
 %%%========== Dispatch to appropriate representation:
 bitmask_new(LogN) ->
-    if LogN >= 20 -> % Use sparse representation.
-            hanoidb_sparse_bitmap:new(LogN);
-       true ->       % Use dense representation.
-            hanoidb_dense_bitmap:new(1 bsl LogN)
-    end.
+    {bitplus, bitplus:set(bitplus:empty(), LogN, 0)}.
+%    if LogN >= 20 -> % Use sparse representation.
+%            hanoidb_sparse_bitmap:new(LogN);
+%       true ->       % Use dense representation.
+%            hanoidb_dense_bitmap:new(1 bsl LogN)
+%    end.
 
 bitmask_set(I, BM) ->
     case element(1,BM) of
+	bitplus -> bitplus:set(BM, I, 1);
         array -> bitarray_set(I, as_array(BM));
         sparse_bitmap -> hanoidb_sparse_bitmap:set(I, BM);
         dense_bitmap_ets -> hanoidb_dense_bitmap:set(I, BM);
@@ -202,6 +210,7 @@ bitmask_set(I, BM) ->
 %%% Convert to external form.
 bitmask_build(BM) ->
     case element(1,BM) of
+	bitplus -> bitplus:compress(BM);
         array -> BM;
         sparse_bitmap -> BM;
         dense_bitmap_ets -> hanoidb_dense_bitmap:build(BM)
@@ -209,6 +218,7 @@ bitmask_build(BM) ->
 
 bitmask_get(I, BM) ->
     case element(1,BM) of
+	bitplus -> bitplus:get(BM, I);
         array -> bitarray_get(I, as_array(BM));
         sparse_bitmap -> hanoidb_sparse_bitmap:member(I, BM);
         dense_bitmap_ets -> hanoidb_dense_bitmap:member(I, BM);
