@@ -250,6 +250,9 @@ receive_fold_range(MRef,PID,Fun,Acc0, Limit) ->
         {'DOWN', MRef, _, _PID, Reason} ->
             ?log("> fold worker ~p DOWN reason:~p~n", [_PID, Reason]),
             error({fold_worker_died, Reason})
+    after 500 ->
+            erlang:exit(PID, shutdown),
+            error(fold_worker_timeout)
     end.
 
 decr(undefined) ->
