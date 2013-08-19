@@ -39,7 +39,7 @@
 -record(node, {level       :: non_neg_integer(),
                members=[]  :: list(any()) }).
 
--record(index, {file       :: file:io_device(),
+-record(index, {file       :: reference(),
                 root       :: #node{} | none,
                 bloom      :: term(),
                 name       :: string(),
@@ -59,7 +59,7 @@ open(Name, Config) ->
     case proplists:get_bool(sequential, Config) of
         true ->
             ReadBufferSize = hanoidb:get_opt(read_buffer_size, Config, 512 * 1024),
-            case file:open(Name, [raw,read,{read_ahead, ReadBufferSize},binary]) of
+            case euv_file:open(Name, [raw,read,{read_ahead, ReadBufferSize},binary]) of
                 {ok, File} ->
                     {ok, #index{file=File, name=Name, config=Config}};
                 {error, _}=Err ->
@@ -71,20 +71,20 @@ open(Name, Config) ->
                 case proplists:get_bool(folding, Config) of
                     true ->
                         ReadBufferSize = hanoidb:get_opt(read_buffer_size, Config, 512 * 1024),
-                        file:open(Name, [read, {read_ahead, ReadBufferSize}, binary]);
+                        euv_file:open(Name, [read, {read_ahead, ReadBufferSize}, binary]);
                     false ->
-                        file:open(Name, [read, binary])
+                        euv_file:open(Name, [read, binary])
                 end,
 
-            {ok, FileInfo} = file:read_file_info(Name),
+            {ok, FileInfo} = euv_file:read_file_info(Name),
 
             %% read and validate magic tag
-            {ok, ?FILE_FORMAT} = file:pread(File, 0, byte_size(?FILE_FORMAT)),
+            {ok, ?FILE_FORMAT} = euv_file:pread(File, 0, byte_size(?FILE_FORMAT)),
 
             %% read root position
-            {ok, <<RootPos:64/unsigned>>} = file:pread(File, FileInfo#file_info.size - 8, 8),
-            {ok, <<BloomSize:32/unsigned>>} = file:pread(File, FileInfo#file_info.size - 12, 4),
-            {ok, BloomData} = file:pread(File, (FileInfo#file_info.size - 12 - BloomSize), BloomSize),
+            {ok, <<RootPos:64/unsigned>>} = euv_file:pread(File, FileInfo#file_info.size - 8, 8),
+            {ok, <<BloomSize:32/unsigned>>} = euv_file:pread(File, FileInfo#file_info.size - 12, 4),
+            {ok, BloomData} = euv_file:pread(File, (FileInfo#file_info.size - 12 - BloomSize), BloomSize),
             Bloom = hanoidb_bloom:decode(BloomData),
 
             %% read in the root node
@@ -100,17 +100,17 @@ open(Name, Config) ->
     end.
 
 destroy(#index{file=File, name=Name}) ->
-    ok = file:close(File),
-    file:delete(Name).
+    ok = euv_file:close(File),
+    euv_file:delete(Name).
 
 serialize(#index{file=File, bloom=undefined }=Index) ->
-    {ok, Position} = file:position(File, cur),
-    ok = file:close(File),
+    {ok, Position} = euv_file:position(File, cur),
+    ok = euv_file:close(File),
     {seq_read_file, Index, Position}.
 
 deserialize({seq_read_file, Index, Position}) ->
     {ok, #index{file=File}=Index2} = open(Index#index.name, Index#index.config),
-    {ok, Position} = file:position(File, {bof, Position}),
+    {ok, Position} = euv_file:position(File, {bof, Position}),
     Index2.
 
 
@@ -138,10 +138,10 @@ fold1(File,Fun,Acc0) ->
 range_fold(Fun, Acc0, #index{file=File,root=Root}, Range) ->
     case lookup_node(File,Range#key_range.from_key,Root,?FIRST_BLOCK_POS) of
         {ok, {Pos,_}} ->
-            {ok, _} = file:position(File, Pos),
+            {ok, _} = euv_file:position(File, Pos),
             do_range_fold(Fun, Acc0, File, Range, Range#key_range.limit);
         {ok, Pos} ->
-            {ok, _} = file:position(File, Pos),
+            {ok, _} = euv_file:position(File, Pos),
             do_range_fold(Fun, Acc0, File, Range, Range#key_range.limit);
         none ->
             {done, Acc0}
@@ -275,7 +275,7 @@ next_node(#index{file=File}=_Index) ->
 close(#index{file=undefined}) ->
     ok;
 close(#index{file=File}) ->
-    file:close(File).
+    euv_file:close(File).
 
 
 lookup(#index{file=File, root=Node, bloom=Bloom}, Key) ->
@@ -373,46 +373,46 @@ find_start(K, KVs) ->
     find_1(K, KVs).
 
 
--spec read_node(file:io_device(), non_neg_integer() | { non_neg_integer(), non_neg_integer() }) ->
+-spec read_node(reference(), non_neg_integer() | { non_neg_integer(), non_neg_integer() }) ->
                        {ok, #node{}} | eof.
 
 read_node(File, {Pos, Size}) ->
 %    error_logger:info_msg("read_node ~p ~p ~p~n", [File, Pos, Size]),
-    {ok, <<_:32/unsigned, Level:16/unsigned, Data/binary>>} = file:pread(File, Pos, Size),
+    {ok, <<_:32/unsigned, Level:16/unsigned, Data/binary>>} = euv_file:pread(File, Pos, Size),
     hanoidb_util:decode_index_node(Level, Data);
 
 read_node(File, Pos) ->
 %    error_logger:info_msg("read_node ~p ~p~n", [File, Pos]),
-    {ok, Pos} = file:position(File, Pos),
+    {ok, Pos} = euv_file:position(File, Pos),
     Result = read_node(File),
 %    error_logger:info_msg("decoded ~p ~p~n", [Pos, Result]),
     Result.
 
 read_node(File) ->
 %    error_logger:info_msg("read_node ~p~n", [File]),
-    {ok, <<Len:32/unsigned, Level:16/unsigned>>} = file:read(File, 6),
+    {ok, <<Len:32/unsigned, Level:16/unsigned>>} = euv_file:read(File, 6),
 %    error_logger:info_msg("decoded ~p ~p~n", [Len, Level]),
     case Len of
         0 ->
             eof;
         _ ->
-            {ok, Data} = file:read(File, Len-2),
+            {ok, Data} = euv_file:read(File, Len-2),
             hanoidb_util:decode_index_node(Level, Data)
     end.
 
 
 next_leaf_node(File) ->
-    case file:read(File, 6) of
+    case euv_file:read(File, 6) of
         eof ->
             %% premature end-of-file
             eof;
         {ok, <<0:32/unsigned, _:16/unsigned>>} ->
             eof;
         {ok, <<Len:32/unsigned, 0:16/unsigned>>} ->
-            {ok, Data} = file:read(File, Len-2),
+            {ok, Data} = euv_file:read(File, Len-2),
             hanoidb_util:decode_index_node(0, Data);
         {ok, <<Len:32/unsigned, _:16/unsigned>>} ->
-            {ok, _} = file:position(File, {cur,Len-2}),
+            {ok, _} = euv_file:position(File, {cur,Len-2}),
             next_leaf_node(File)
     end.
 

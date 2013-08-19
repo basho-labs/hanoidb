@@ -45,7 +45,7 @@
                members=[] :: [ {key(), expvalue()} ],
                size=0     :: integer()}).
 
--record(state, {index_file               :: file:io_device() | undefined,
+-record(state, {index_file               :: reference() | undefined,
                 index_file_pos           :: integer(),
 
                 last_node_pos            :: pos_integer(),
@@ -93,7 +93,7 @@ init([Name, Options]) ->
 
     case do_open(Name, Options, [exclusive]) of
         {ok, IdxFile} ->
-            ok = file:write(IdxFile, ?FILE_FORMAT),
+            ok = euv_file:write(IdxFile, ?FILE_FORMAT),
             Bloom = hanoidb_bloom:bloom(Size),
             BlockSize = hanoidb:get_opt(block_size, Options, ?NODE_SIZE),
             {ok, #state{ name=Name,
@@ -154,8 +154,8 @@ terminate(normal,_State) ->
     ok;
 terminate(_Reason, State) ->
     %% premature delete -> cleanup
-    _ignore = file:close(State#state.index_file),
-    file:delete(hanoidb_util:index_file_name(State#state.name)).
+    _ignore = euv_file:close(State#state.index_file),
+    euv_file:delete(hanoidb_util:index_file_name(State#state.name)).
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
@@ -163,13 +163,13 @@ code_change(_OldVsn, State, _Extra) ->
 
 %% INTERNAL FUNCTIONS
 serialize(#state{ bloom=Bloom, index_file=File, index_file_pos=Position }=State) ->
-    case file:position(File, {eof, 0}) of
+    case euv_file:position(File, {eof, 0}) of
         {ok, Position} ->
             ok;
         {ok, WrongPosition} ->
             exit({bad_position, Position, WrongPosition})
     end,
-    ok = file:close(File),
+    ok = euv_file:close(File),
     erlang:term_to_binary( { State#state{ index_file=undefined }, hanoidb_bloom:encode(Bloom) } ).
 
 deserialize(Binary) ->
@@ -181,7 +181,7 @@ deserialize(Binary) ->
 
 do_open(Name, Options, OpenOpts) ->
     WriteBufferSize = hanoidb:get_opt(write_buffer_size, Options, 512 * 1024),
-    file:open(hanoidb_util:index_file_name(Name),
+    euv_file:open(hanoidb_util:index_file_name(Name),
               [raw, append, {delayed_write, WriteBufferSize, 2000} | OpenOpts]).
 
 
@@ -194,16 +194,16 @@ archive_nodes(#state{ nodes=[], last_node_pos=LastNodePos, last_node_size=_LastN
         case LastNodePos of
             undefined ->
                 %% store contains no entries
-                ok = file:write(IdxFile, <<0:32/unsigned, 0:16/unsigned>>),
+                ok = euv_file:write(IdxFile, <<0:32/unsigned, 0:16/unsigned>>),
                 ?FIRST_BLOCK_POS;
             _ ->
                 LastNodePos
         end,
     Trailer = << 0:32/unsigned, BloomBin/binary, BloomSize:32/unsigned,  RootPos:64/unsigned >>,
 
-    ok = file:write(IdxFile, Trailer),
-    ok = file:datasync(IdxFile),
-    ok = file:close(IdxFile),
+    ok = euv_file:write(IdxFile, Trailer),
+    ok = euv_file:datasync(IdxFile),
+    ok = euv_file:close(IdxFile),
     {ok, State#state{ index_file=undefined, index_file_pos=undefined }};
 
 archive_nodes(State=#state{ nodes=[#node{level=N, members=[{_,{Pos,_Len}}]}], last_node_pos=Pos })
@@ -275,7 +275,7 @@ flush_node_buffer(#state{nodes=[#node{ level=Level, members=NodeMembers }|RestNo
     Data = [ <<(BlockSize+2):32/unsigned, Level:16/unsigned>> | BlockData ],
     DataSize = BlockSize + 6,
 
-    ok = file:write(State#state.index_file, Data),
+    ok = euv_file:write(State#state.index_file, Data),
 
     {FirstKey, _} = hd(OrderedMembers),
     append_node(Level + 1, FirstKey, {NodePos, DataSize},
