@@ -1,6 +1,6 @@
 TARGET=		hanoidb
 
-REBAR=		rebar
+REBAR=		./rebar
 DIALYZER=	dialyzer
 
 
